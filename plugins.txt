@@ -1,0 +1,8 @@
+# Plugins to install from the codelabs marketplace.
+# One per line. Lines starting with # are ignored.
+
+codelabs-cofounder
+codelabs-dev-servers
+codelabs-advisors
+codelabs-feature-port
+codelabs-role-empathy
