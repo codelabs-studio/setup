@@ -119,6 +119,116 @@ else
     warn "jq no disponible: se omiten los asserts de forma del payload"
 fi
 
+# ── 5. end-to-end contra un servidor HTTP local falso: reproduce el bug real
+# encontrado al usar esto (post_enroll fijaba RESP_BODY_FILE dentro de un
+# "$(post_enroll …)", que corre en subshell; la variable nunca volvía al
+# llamador y, bajo `set -u` (bin/codelabs-setup usa -euo pipefail), el primer
+# acceso a $RESP_BODY_FILE reventaba el script justo después de recibir un
+# 201 con el token — dejando el fichero de respuesta, con el token en claro,
+# huérfano en /tmp). Hermético: Keychain y hooks.env de owner FALSOS (no toca
+# el internal_api_key real), y servicio de Keychain del token de máquina
+# FALSO: un llavero de usar-y-tirar, creado y borrado por este test, referido
+# SIEMPRE por su ruta explícita (nunca el llavero por defecto del usuario, ni
+# su lista de búsqueda, que este test no toca para nada). Si no se puede
+# crear un llavero de prueba, el caso se omite en vez de arriesgarse a tocar
+# el real o disparar un diálogo del sistema (lo segundo ya pasó una vez: un
+# `security add-generic-password` sin llavero explícito abrió "Llavero no
+# encontrado" en la sesión real de Jose).
+if has_cmd python3 && has_cmd jq && has_cmd security; then
+    MOCK_DIR="$(mktemp -d)"
+    TEST_KEYCHAIN="$MOCK_DIR/test-fleet.keychain-db"
+    TEST_KEYCHAIN_PASS="$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64)"
+    KEYCHAIN_READY=false
+    cleanup_test_keychain() {
+        has_cmd security && security delete-keychain "$TEST_KEYCHAIN" >/dev/null 2>&1
+        rm -f "$TEST_KEYCHAIN" "${TEST_KEYCHAIN}-lock" 2>/dev/null
+    }
+    trap cleanup_test_keychain EXIT
+
+    if security create-keychain -p "$TEST_KEYCHAIN_PASS" "$TEST_KEYCHAIN" >/dev/null 2>&1 \
+        && security unlock-keychain -p "$TEST_KEYCHAIN_PASS" "$TEST_KEYCHAIN" >/dev/null 2>&1; then
+        KEYCHAIN_READY=true
+    fi
+
+    if [[ "$KEYCHAIN_READY" == true ]]; then
+        TEST_KC_PREFIX="codelabs/memoryfirst-TEST-FAKE-$$"
+        # Clave de owner falsa, sembrada YA en el llavero de prueba (con su
+        # ruta explícita) para que resolve_owner_api_key la lea de ahí, no
+        # del llavero real ni de ningún fichero de hooks.
+        security add-generic-password -U \
+            -s "${TEST_KC_PREFIX}/internal_api_key" -a memoryfirst \
+            -w "fake-owner-key-for-test-only" "$TEST_KEYCHAIN" >/dev/null 2>&1
+
+        PORT=$(( (RANDOM % 20000) + 20000 ))
+        cat > "$MOCK_DIR/server.py" <<PY
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        body = json.dumps({
+            "machine": {"name": "m2max-16-jose-test", "id": "test-machine-id"},
+            "token": "mf_test_TOKEN_never_real_1234567890",
+            "tokenNote": "test",
+        }).encode()
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", $PORT), H).serve_forever()
+PY
+        python3 "$MOCK_DIR/server.py" &
+        SERVER_PID=$!
+        # da tiempo al servidor a abrir el puerto, sin usar sleeps largos
+        for _ in $(seq 1 30); do
+            (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && { exec 3>&-; break; }
+            sleep 0.1
+        done
+
+        fake_home3="$(mktemp -d)"
+
+        E2E_OUT="$(
+            HOME="$fake_home3" \
+            FLEET_API_URL="http://127.0.0.1:${PORT}" \
+            MEMORYFIRST_KEYCHAIN_PREFIX="$TEST_KC_PREFIX" \
+            MF_KEYCHAIN_FILE="$TEST_KEYCHAIN" \
+            MACHINE_TOKEN_KC_SERVICE="${TEST_KC_PREFIX}/machine_token" \
+            MACHINE_TOKEN_KC_ACCOUNT="memoryfirst-test" \
+            MACHINE_TOKEN_KEYCHAIN="$TEST_KEYCHAIN" \
+            "$BIN" register --name m2max-16-jose-test \
+                --person 22222222-2222-2222-2222-222222222222 --pack founder 2>&1
+        )"
+        E2E_RC=$?
+
+        kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+
+        assert "e2e register: no revienta con 'unbound variable' bajo set -u (el bug real)" \
+            '[[ "$E2E_OUT" != *"unbound variable"* ]]'
+        assert "e2e register: sale con éxito" '[[ $E2E_RC -eq 0 ]]'
+        assert "e2e register: confirma HTTP 201" '[[ "$E2E_OUT" == *"HTTP 201"* ]]'
+        assert "e2e register: nunca imprime el token de prueba" \
+            '[[ "$E2E_OUT" != *"mf_test_TOKEN_never_real"* ]]'
+        assert "e2e register: nunca imprime la clave de owner falsa" \
+            '[[ "$E2E_OUT" != *"fake-owner-key-for-test-only"* ]]'
+        assert "e2e register: guarda el perfil local" \
+            '[[ -f "$fake_home3/.config/codelabs/machine.json" ]]'
+        assert "e2e register: guardó el token en el llavero de prueba (no el real)" \
+            'security find-generic-password -s "${TEST_KC_PREFIX}/machine_token" -a "memoryfirst-test" "$TEST_KEYCHAIN" >/dev/null 2>&1'
+
+        rm -rf "$fake_home3"
+    else
+        printf 'SKIP e2e register (no se pudo crear un llavero de prueba temporal)\n'
+    fi
+
+    cleanup_test_keychain
+    trap - EXIT
+    rm -rf "$MOCK_DIR"
+else
+    printf 'SKIP e2e register (falta python3, jq o security)\n'
+fi
+
 echo
 if (( FAILURES == 0 )); then
     echo "test_fleet: todo OK"

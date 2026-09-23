@@ -42,6 +42,14 @@ MACHINE_PROFILE_FILE="$MACHINE_CONFIG_DIR/machine.json"
 MACHINE_TOKEN_KC_SERVICE="${MACHINE_TOKEN_KC_SERVICE:-codelabs/memoryfirst/machine_token}"
 MACHINE_TOKEN_KC_ACCOUNT="${MACHINE_TOKEN_KC_ACCOUNT:-memoryfirst}"
 MACHINE_TOKEN_ENV_FILE="${MACHINE_TOKEN_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/memoryfirst/hooks.env}"
+# Ruta de un llavero EXPLÍCITO para el add-generic-password del token de
+# máquina. Vacío (por defecto, uso normal): security usa el llavero por
+# defecto del usuario, igual que siempre. Los tests la fijan a un llavero de
+# usar-y-tirar creado con `security create-keychain`, para no tocar nunca el
+# llavero real ni abrir un diálogo del sistema si el proceso no tiene sesión
+# de llavero (2026-09-23: un test sin esto disparó el diálogo "Llavero no
+# encontrado" en la sesión real de Jose).
+MACHINE_TOKEN_KEYCHAIN="${MACHINE_TOKEN_KEYCHAIN:-}"
 
 # Prefijo/cuenta del Llavero y fichero de hooks: igual que
 # packages/claude-hooks/install.sh (KC_PREFIX/KC_ACCOUNT/ENV_FILE), para leer
@@ -49,6 +57,9 @@ MACHINE_TOKEN_ENV_FILE="${MACHINE_TOKEN_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.conf
 MF_KEYCHAIN_PREFIX="${MEMORYFIRST_KEYCHAIN_PREFIX:-codelabs/memoryfirst}"
 MF_KEYCHAIN_ACCOUNT="${MEMORYFIRST_KEYCHAIN_ACCOUNT:-memoryfirst}"
 MF_HOOKS_ENV_FILE="${MEMORYFIRST_HOOKS_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/memoryfirst/hooks.env}"
+# Mismo mecanismo que MACHINE_TOKEN_KEYCHAIN, pero para el find-generic-password
+# de resolve_owner_api_key. Vacío = llavero por defecto (uso normal).
+MF_KEYCHAIN_FILE="${MF_KEYCHAIN_FILE:-}"
 
 build_enroll_payload() {
     cat <<EOF
@@ -77,18 +88,42 @@ save_local_profile() {
 # claude-hooks (memoryfirst-session-start.sh y compañía). Nunca la imprime:
 # el fichero de hooks se fuente dentro de un subshell y solo su valor sale
 # por `printf` a la sustitución de comandos que la captura en la variable.
+#
+# OJO set -e: bin/codelabs-setup corre con `set -euo pipefail`. Un "cmd &&
+# cmd" o "cmd || cmd" como ÚLTIMA sentencia de una función se evalúa bien por
+# dentro, pero dado que ese es también el código de salida de la FUNCIÓN, y
+# esta se invoca como sentencia suelta ("resolve_owner_api_key", sin
+# envolver en if/&&/||), un resultado "falso" ahí aborta el script entero SIN
+# ningún mensaje (así se depuró este mismo fichero: la clave se leía bien del
+# Llavero, pero la función terminaba en un "[[ -z ... ]] && …" que daba
+# falso — clave ya resuelta — y esa vuelta con estado 1 mataba el script justo
+# después de "Registro de la máquina…", con el cuerpo de la respuesta y el
+# token que hubiera devuelto la API perdidos en un fichero temporal huérfano).
+# Por eso aquí todo es if/fi explícito y se cierra con un "return 0" literal.
 resolve_owner_api_key() {
     OWNER_API_KEY=""
     if has_cmd security; then
-        OWNER_API_KEY="$(security find-generic-password -s "${MF_KEYCHAIN_PREFIX}/internal_api_key" -a "${MF_KEYCHAIN_ACCOUNT}" -w 2>/dev/null || true)"
+        # Llavero explícito solo si MF_KEYCHAIN_FILE lo fija (tests); en uso
+        # normal, array vacío = security usa el llavero por defecto de
+        # siempre, sin cambio de comportamiento.
+        local -a kc_file=()
+        if [[ -n "$MF_KEYCHAIN_FILE" ]]; then
+            kc_file=("$MF_KEYCHAIN_FILE")
+        fi
+        OWNER_API_KEY="$(security find-generic-password -s "${MF_KEYCHAIN_PREFIX}/internal_api_key" -a "${MF_KEYCHAIN_ACCOUNT}" -w "${kc_file[@]}" 2>/dev/null || true)"
     fi
     if [[ -z "$OWNER_API_KEY" ]]; then
         OWNER_API_KEY="$(
-            [[ -r "$MF_HOOKS_ENV_FILE" ]] && . "$MF_HOOKS_ENV_FILE"
+            if [[ -r "$MF_HOOKS_ENV_FILE" ]]; then
+                . "$MF_HOOKS_ENV_FILE"
+            fi
             printf '%s' "${MEMORYFIRST_API_KEY:-}"
         )"
     fi
-    [[ -z "$OWNER_API_KEY" ]] && OWNER_API_KEY="${MEMORYFIRST_API_KEY:-}"
+    if [[ -z "$OWNER_API_KEY" ]]; then
+        OWNER_API_KEY="${MEMORYFIRST_API_KEY:-}"
+    fi
+    return 0
 }
 
 # store_machine_token <token> — nunca lo imprime, nunca lo pasa por argv.
@@ -103,14 +138,19 @@ store_machine_token() {
         # dobles, escapando \ y " dentro del valor.
         local esc="${token//\\/\\\\}"
         esc="${esc//\"/\\\"}"
+        # El llavero destino es un argumento posicional más de la línea que
+        # entiende `security -i`; se añade solo si MACHINE_TOKEN_KEYCHAIN lo
+        # fija (tests, con un llavero de usar-y-tirar), nunca el llavero real.
+        local sec_cmd="add-generic-password -U -s \"${MACHINE_TOKEN_KC_SERVICE}\" -a \"${MACHINE_TOKEN_KC_ACCOUNT}\" -w \"${esc}\""
+        if [[ -n "$MACHINE_TOKEN_KEYCHAIN" ]]; then
+            sec_cmd+=" \"${MACHINE_TOKEN_KEYCHAIN}\""
+        fi
         # Salida silenciada: si `security -i` no entiende la línea la repite
         # en pantalla, secreto incluido. Solo cuenta el código de salida
         # (mismo arreglo que memoryfirst/packages/claude-hooks/install.sh,
-        # función keychain_set, commit 2d67eea).
-        if security -i >/dev/null 2>&1 <<SEC
-add-generic-password -U -s "${MACHINE_TOKEN_KC_SERVICE}" -a "${MACHINE_TOKEN_KC_ACCOUNT}" -w "${esc}"
-SEC
-        then
+        # función keychain_set, commit 2d67eea). El comando viaja por un pipe
+        # (no por argv), igual de seguro que el heredoc que sustituye.
+        if printf '%s\n' "$sec_cmd" | security -i >/dev/null 2>&1; then
             ok "Token de máquina guardado en el Llavero ($MACHINE_TOKEN_KC_SERVICE / $MACHINE_TOKEN_KC_ACCOUNT). No se imprime."
         else
             warn "No se pudo guardar el token en el Llavero; repite 'codelabs-setup register' o guárdalo a mano con los hooks de MemoryFirst (--machine-token)."
@@ -131,15 +171,19 @@ SEC
     fi
 }
 
-# post_enroll <payload> <api_key> — hace el POST autenticado y devuelve por
-# stdout el código HTTP. El cuerpo de la respuesta queda en $RESP_BODY_FILE
-# (global, la limpia el llamador). La clave viaja a curl en un fichero de
+# post_enroll <payload> <api_key> <resp_body_file> — hace el POST autenticado
+# y devuelve por stdout el código HTTP. Escribe el cuerpo de la respuesta en
+# <resp_body_file>, que crea y limpia el LLAMADOR (nunca una variable global
+# puesta desde aquí: post_enroll se invoca como "$(post_enroll …)", eso corre
+# en un subshell, y una asignación global hecha ahí dentro no sobrevive a la
+# vuelta — bajo `set -u` el primer acceso posterior revienta el script con
+# "unbound variable", cosa que en el fondo dejaba huérfano en /tmp el propio
+# fichero con el token en claro). La clave viaja a curl en un fichero de
 # cabecera 0600 (-H "@fichero", ver "man curl"), nunca por argv ni por
 # stdin: un fichero temporal por llamada, borrado con un trap de retorno de
 # la función aunque curl falle.
 post_enroll() {
-    local payload="$1" api_key="${2:-}"
-    RESP_BODY_FILE="$(mktemp)"
+    local payload="$1" api_key="${2:-}" resp_body_file="$3"
     local header_file=""
     if [[ -n "$api_key" ]]; then
         header_file="$(mktemp)"
@@ -150,9 +194,11 @@ post_enroll() {
     trap "[[ -n '${header_file}' ]] && rm -f '${header_file}'" RETURN
 
     local -a auth_args=()
-    [[ -n "$header_file" ]] && auth_args=(-H "@${header_file}")
+    if [[ -n "$header_file" ]]; then
+        auth_args=(-H "@${header_file}")
+    fi
 
-    curl -sS -o "$RESP_BODY_FILE" -w '%{http_code}' -X POST \
+    curl -sS -o "$resp_body_file" -w '%{http_code}' -X POST \
         -H 'Content-Type: application/json' \
         "${auth_args[@]}" \
         --max-time 15 \
@@ -197,13 +243,16 @@ register_machine() {
         return
     fi
 
+    local resp_body_file; resp_body_file="$(mktemp)"
     local http_code
-    http_code="$(post_enroll "$payload" "$OWNER_API_KEY")"
+    http_code="$(post_enroll "$payload" "$OWNER_API_KEY" "$resp_body_file")"
 
     case "$http_code" in
         2??)
-            local token; token="$(extract_token "$RESP_BODY_FILE")"
-            [[ -n "$token" && "$token" != "null" ]] && store_machine_token "$token"
+            local token; token="$(extract_token "$resp_body_file")"
+            if [[ -n "$token" && "$token" != "null" ]]; then
+                store_machine_token "$token"
+            fi
             save_local_profile "$payload"
             ok "Máquina registrada en la flota (HTTP $http_code). El token solo se muestra una vez: si vuelves a enrolar esta máquina, el anterior queda revocado."
             ;;
@@ -225,7 +274,7 @@ register_machine() {
             save_local_profile "$payload"
             ;;
     esac
-    rm -f "$RESP_BODY_FILE"
+    rm -f "$resp_body_file"
 }
 
 retry_register() {
@@ -240,12 +289,15 @@ retry_register() {
 
     log "Reintentando registro de flota con el perfil guardado ($MACHINE_PROFILE_FILE)"
     local payload; payload="$(cat "$MACHINE_PROFILE_FILE")"
+    local resp_body_file; resp_body_file="$(mktemp)"
     local http_code
-    http_code="$(post_enroll "$payload" "$OWNER_API_KEY")"
+    http_code="$(post_enroll "$payload" "$OWNER_API_KEY" "$resp_body_file")"
     case "$http_code" in
         2??)
-            local token; token="$(extract_token "$RESP_BODY_FILE")"
-            [[ -n "$token" && "$token" != "null" ]] && store_machine_token "$token"
+            local token; token="$(extract_token "$resp_body_file")"
+            if [[ -n "$token" && "$token" != "null" ]]; then
+                store_machine_token "$token"
+            fi
             ok "Máquina registrada (HTTP $http_code). El token solo se muestra una vez; un nuevo enroll de esta máquina revocaría este."
             ;;
         404) warn "Sigue en 404: la API de flota no responde en esa ruta todavía." ;;
@@ -253,5 +305,5 @@ retry_register() {
         401|403) warn "La API rechazó el reintento (HTTP $http_code): la clave usada no es de owner, o no es válida." ;;
         *) warn "Sigue fallando (HTTP $http_code)." ;;
     esac
-    rm -f "$RESP_BODY_FILE"
+    rm -f "$resp_body_file"
 }
