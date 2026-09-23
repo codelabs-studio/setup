@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# codelabs-setup v2 — instalador único de máquina nueva.
+#
+# Fusiona codelabs-setup (mayo 2026, plugins + hooks + dev-proxy) y
+# claude-bootstrap (febrero 2026, retirado: ver su README) en un solo CLI por
+# "pack" de persona (founder, developer, marketer, learner, worker), con alta
+# en la flota de MemoryFirst. Diseño: doc 63 del cerebro de cofundador,
+# apartados 2.6 y 12.3.
+#
+# REGLA DE DISEÑO: ningún portátil guarda secretos de producción. Este script
+# no copia ningún .env real, no exporta secretos en dotfiles y no imprime
+# ninguna credencial. Ver lib/steps.sh para el detalle.
+
+set -euo pipefail
+
+resolve_root() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -L "$src" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")/.." >/dev/null && pwd
+}
+SETUP_ROOT="$(resolve_root)"
+
+# shellcheck source=lib/common.sh
+source "$SETUP_ROOT/lib/common.sh"
+# shellcheck source=lib/hardware.sh
+source "$SETUP_ROOT/lib/hardware.sh"
+# shellcheck source=lib/capabilities.sh
+source "$SETUP_ROOT/lib/capabilities.sh"
+# shellcheck source=lib/packs.sh
+source "$SETUP_ROOT/lib/packs.sh"
+# shellcheck source=lib/steps.sh
+source "$SETUP_ROOT/lib/steps.sh"
+# shellcheck source=lib/fleet.sh
+source "$SETUP_ROOT/lib/fleet.sh"
+# shellcheck source=lib/doctor.sh
+source "$SETUP_ROOT/lib/doctor.sh"
+
+usage() {
+    cat <<'EOF'
+codelabs-setup v2 — instalador único de máquina nueva
+
+USO
+  codelabs-setup enroll --name <nombre> --person <email-o-id> \
+                         --pack <founder|developer|marketer|learner|worker> \
+                         [--repos repo-a,repo-b] [--dry-run]
+  codelabs-setup doctor
+  codelabs-setup register
+  codelabs-setup --help
+
+enroll
+  --name    Nombre de la máquina (aparece en la vista Flota de AlmaOS)
+  --person  Email o id de la persona dueña de esta máquina
+  --pack    founder | developer | marketer | learner | worker
+  --repos   Lista separada por comas de repos de Forgejo a clonar, además de
+            los del pack por defecto (si los tiene)
+  --dry-run Imprime lo que haría, sin instalar ni escribir nada
+
+doctor
+  Comprueba lo instalado y lo que falta. Nunca muestra el valor de una
+  credencial, solo si existe y con qué permisos.
+
+register
+  Reintenta el alta en la flota de MemoryFirst con el perfil ya guardado en
+  ~/.config/codelabs/machine.json (para cuando el primer enroll dio 404
+  porque la API todavía no existía).
+EOF
+}
+
+cmd_enroll() {
+    local name="" person="" pack="" repos_csv=""
+    DRY_RUN=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="${2:?falta el valor de --name}"; shift 2 ;;
+            --person) person="${2:?falta el valor de --person}"; shift 2 ;;
+            --pack) pack="${2:?falta el valor de --pack}"; shift 2 ;;
+            --repos) repos_csv="${2:?falta el valor de --repos}"; shift 2 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Opción desconocida: $1 (usa --help)" ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "Falta --name"
+    [[ -n "$person" ]] || die "Falta --person"
+    [[ -n "$pack" ]] || die "Falta --pack"
+
+    MACHINE_NAME="$name"
+    MACHINE_PERSON="$person"
+
+    load_pack "$pack"
+
+    local -a repos=()
+    if [[ -n "$repos_csv" ]]; then
+        IFS=',' read -ra repos <<< "$repos_csv"
+    fi
+
+    log "codelabs-setup enroll — $PACK_LABEL"
+    info "Máquina: $MACHINE_NAME · Persona: $MACHINE_PERSON · Pack: $pack"
+    [[ "$DRY_RUN" == true ]] && info "MODO DRY-RUN: no se instala ni se escribe nada"
+    echo
+
+    detect_hardware
+    detect_capabilities
+    hardware_summary
+    echo
+    capabilities_summary
+    echo
+
+    local -a effective_repos=()
+    if [[ ${#repos[@]} -gt 0 ]]; then
+        effective_repos=("${repos[@]}")
+    elif [[ ${#PACK_DEFAULT_REPOS[@]} -gt 0 ]]; then
+        effective_repos=("${PACK_DEFAULT_REPOS[@]}")
+    fi
+
+    local needs_code_access=false
+    if [[ "$PACK_CLONES_CODE" == true && ${#effective_repos[@]} -gt 0 ]]; then
+        needs_code_access=true
+    fi
+    local needs_dev_env=false
+    if [[ "$PACK_INSTALLS_CLAUDE" == true || "$needs_code_access" == true ]]; then
+        needs_dev_env=true
+    fi
+
+    if [[ "$pack" == "founder" && ${#repos[@]} -eq 0 ]]; then
+        info "Sin --repos: clonando el núcleo (${PACK_DEFAULT_REPOS[*]}). Para el resto del portfolio, repite con --repos."
+    fi
+    if [[ "$pack" == "developer" && ${#repos[@]} -eq 0 ]]; then
+        warn "Pack developer sin --repos: no se clona ningún código (decláralos explícitamente, nunca 'todos por si acaso')."
+    fi
+
+    if [[ "$needs_dev_env" == true ]]; then
+        step_tailscale
+        step_git
+        step_node
+        step_pnpm
+        step_python
+    fi
+
+    [[ "$PACK_WANTS_DEV_TOOLING" == true ]] && { step_system_packages; step_devproxy; }
+    [[ "$PACK_WANTS_DOCKER" == true ]] && step_docker
+    [[ "$PACK_WANTS_MAESTRO" == true ]] && step_maestro
+
+    if [[ "$PACK_INSTALLS_CLAUDE" == true ]]; then
+        step_claude_and_plugins
+        step_claude_md "$PACK_CLAUDE_MD_FLAVOR"
+        step_settings_merge
+        step_memoryfirst_hooks
+    else
+        info "Este pack no instala Claude Code ($PACK_LABEL) — ver packs/${pack}.pack.sh para el motivo."
+    fi
+
+    if [[ "$needs_code_access" == true ]]; then
+        step_clone_repos "${effective_repos[@]}"
+        step_env_templates "${effective_repos[@]}"
+    fi
+
+    [[ ${#PACK_SHORTCUTS[@]} -gt 0 ]] && step_shortcuts
+
+    echo
+    register_machine
+
+    echo
+    ok "enroll completo ($PACK_LABEL: $MACHINE_NAME)."
+    if [[ "$DRY_RUN" == true ]]; then
+        info "Era un dry-run: no se ha instalado ni escrito nada."
+    fi
+    return 0
+}
+
+cmd_doctor() {
+    run_doctor
+}
+
+cmd_register() {
+    detect_hardware
+    detect_capabilities
+    retry_register
+}
+
+main() {
+    local sub="${1:-}"
+    case "$sub" in
+        enroll) shift; cmd_enroll "$@" ;;
+        doctor) shift; cmd_doctor "$@" ;;
+        register) shift; cmd_register "$@" ;;
+        -h|--help|"") usage ;;
+        *) die "Subcomando desconocido: '$sub' (usa --help)" ;;
+    esac
+}
+
+main "$@"
