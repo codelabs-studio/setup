@@ -19,9 +19,14 @@ resolve_root() {
         local dir
         dir="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
         src="$(readlink "$src")"
-        [[ "$src" != /* ]] && src="$dir/$src"
+        if [[ "$src" != /* ]]; then
+            src="$dir/$src"
+        fi
     done
-    cd -P "$(dirname "$src")/.." >/dev/null && pwd
+    if cd -P "$(dirname "$src")/.." >/dev/null; then
+        pwd
+    fi
+    return 0
 }
 SETUP_ROOT="$(resolve_root)"
 

@@ -6,7 +6,9 @@ KNOWN_PACKS=(founder developer marketer learner worker)
 is_known_pack() {
     local p="$1" k
     for k in "${KNOWN_PACKS[@]}"; do
-        [[ "$k" == "$p" ]] && return 0
+        if [[ "$k" == "$p" ]]; then
+            return 0
+        fi
     done
     return 1
 }

@@ -62,8 +62,12 @@ detect_capabilities() {
     #   límite por CPU: 1 agente cada 2 núcleos
     local by_ram=$(( HW_RAM_GB / 4 ))
     local by_cpu=$(( HW_CPU_CORES / 2 ))
-    (( by_ram < 1 )) && by_ram=1
-    (( by_cpu < 1 )) && by_cpu=1
+    if (( by_ram < 1 )); then
+        by_ram=1
+    fi
+    if (( by_cpu < 1 )); then
+        by_cpu=1
+    fi
     if (( by_ram < by_cpu )); then
         CAP_MAX_PARALLEL_AGENTS=$by_ram
     else

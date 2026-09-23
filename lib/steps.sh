@@ -15,7 +15,9 @@ FORGEJO_ORG="${FORGEJO_ORG:-jose}"
 MEMORYFIRST_HOOKS_DIR="${MEMORYFIRST_HOOKS_DIR:-$CODE_ROOT/memoryfirst/packages/claude-hooks}"
 
 ensure_jq() {
-    has_cmd jq && return 0
+    if has_cmd jq; then
+        return 0
+    fi
     log "jq"
     if [[ "$HW_OS" == macos ]]; then
         require_cmd brew "Homebrew no está instalado; instálalo primero (https://brew.sh)"
@@ -37,7 +39,9 @@ step_tailscale() {
             run brew install --cask tailscale
         else
             would "curl -fsSL https://tailscale.com/install.sh | sh"
-            [[ "$DRY_RUN" != true ]] && curl -fsSL https://tailscale.com/install.sh | sh
+            if [[ "$DRY_RUN" != true ]]; then
+                curl -fsSL https://tailscale.com/install.sh | sh
+            fi
         fi
     else
         ok "tailscale ya instalado"
@@ -228,7 +232,9 @@ step_claude_and_plugins() {
 
 step_claude_md() {
     local flavor="$1"
-    [[ -z "$flavor" ]] && return
+    if [[ -z "$flavor" ]]; then
+        return 0
+    fi
     log "CLAUDE.md ($flavor)"
     local claude_dir="$HOME/.claude"
     run mkdir -p "$claude_dir"
@@ -264,7 +270,9 @@ step_claude_md() {
 # toca permissions, mcpServers ni cualquier otra clave existente; sigue el
 # mismo patrón de merge quirúrgico del instalador de hooks de MemoryFirst.
 step_settings_merge() {
-    [[ ${#PACK_PLUGINS[@]} -eq 0 ]] && return
+    if [[ ${#PACK_PLUGINS[@]} -eq 0 ]]; then
+        return 0
+    fi
     log "settings.json: hooks y plugins del pack"
     ensure_jq
     local claude_dir="$HOME/.claude"
@@ -388,7 +396,9 @@ step_clone_repos() {
 # valor plausible.
 step_env_templates() {
     local repos=("$@")
-    [[ ${#repos[@]} -eq 0 ]] && return
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        return 0
+    fi
     log "Generando .env de desarrollo desde plantilla (si el repo la trae)"
     local repo dir template dest
     for repo in "${repos[@]}"; do
@@ -441,7 +451,9 @@ step_env_templates() {
 # ---------------------------------------------------------------------------
 
 step_shortcuts() {
-    [[ ${#PACK_SHORTCUTS[@]} -eq 0 ]] && return
+    if [[ ${#PACK_SHORTCUTS[@]} -eq 0 ]]; then
+        return 0
+    fi
     local dest_dir="$HOME/Codelabs Links"
     log "Accesos directos"
     run mkdir -p "$dest_dir"
