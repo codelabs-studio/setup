@@ -3,17 +3,35 @@
 #
 # POST /v1/fleet/machines/enroll (https://api.memoryfirst.ai) con el perfil
 # de hardware y capacidades (nada sensible: modelo, RAM, CPU, SO,
-# capacidades deducidas). Solo lo puede llamar el owner; el token que
-# devuelve se muestra UNA vez y volver a enrolar la misma máquina revoca el
-# anterior (contrato: memoryfirst/apps/api/README.md).
+# capacidades deducidas). Solo lo puede llamar el owner (contrato:
+# memoryfirst/apps/api/README.md, y el esquema real en
+# memoryfirst/apps/api/src/routes/work.ts EnrollSchema: name, personId?,
+# tags?, hw?, capabilities?, tailscaleNode? — de ahí que el payload use "hw"
+# y "personId", no "hardware" ni "person"). La llamada exige
+# `Authorization: Bearer <clave de owner>`; el token que la API devuelve se
+# muestra UNA vez y volver a enrolar la misma máquina revoca el anterior.
 #
-# El token se guarda EXACTAMENTE donde lo leen los hooks de MemoryFirst
-# (packages/claude-hooks/install.sh --machine-token): Keychain en macOS
-# (servicio codelabs/memoryfirst/machine_token, cuenta memoryfirst) o un
-# fichero 0600 en Linux (~/.config/memoryfirst/hooks.env). NUNCA pasa por
-# argv de un proceso ajeno: en macOS se alimenta a `security -i` por stdin
-# (un heredoc), nunca como `security ... -w "$token"` en la línea de
-# comandos — eso queda entero en `ps` para cualquiera en la máquina.
+# La clave de owner (mf_live_…) se lee exactamente de donde la guarda
+# packages/claude-hooks/install.sh (--credentials): Keychain en macOS
+# (servicio codelabs/memoryfirst/internal_api_key, cuenta memoryfirst) o
+# MEMORYFIRST_API_KEY en ~/.config/memoryfirst/hooks.env en Linux. Se lee a
+# una variable DENTRO de una función y nunca se imprime; viaja a curl en un
+# fichero de cabecera 0600 (`-H "@fichero"`, ver man curl), nunca por argv
+# (quedaría entero en `ps`) ni por stdin de un heredoc compartido con otra
+# cosa.
+#
+# El token de máquina que devuelve el enroll se guarda EXACTAMENTE donde lo
+# leen los hooks de MemoryFirst (packages/claude-hooks/install.sh
+# --machine-token): Keychain en macOS (servicio
+# codelabs/memoryfirst/machine_token, cuenta memoryfirst) o un fichero 0600
+# en Linux (~/.config/memoryfirst/hooks.env). NUNCA pasa por argv de un
+# proceso ajeno: en macOS se alimenta a `security -i` por stdin (un
+# heredoc), nunca como `security ... -w "$token"` en la línea de comandos —
+# eso queda entero en `ps` para cualquiera en la máquina. Y su salida se
+# silencia (`>/dev/null 2>&1`): si `security -i` no entiende la línea la
+# repite en pantalla, secreto incluido, así que solo cuenta el código de
+# salida (mismo arreglo que memoryfirst/packages/claude-hooks/install.sh,
+# función keychain_set, commit 2d67eea).
 
 FLEET_API_URL="${FLEET_API_URL:-https://api.memoryfirst.ai}"
 MACHINE_CONFIG_DIR="${MACHINE_CONFIG_DIR:-$HOME/.config/codelabs}"
@@ -25,13 +43,20 @@ MACHINE_TOKEN_KC_SERVICE="${MACHINE_TOKEN_KC_SERVICE:-codelabs/memoryfirst/machi
 MACHINE_TOKEN_KC_ACCOUNT="${MACHINE_TOKEN_KC_ACCOUNT:-memoryfirst}"
 MACHINE_TOKEN_ENV_FILE="${MACHINE_TOKEN_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/memoryfirst/hooks.env}"
 
+# Prefijo/cuenta del Llavero y fichero de hooks: igual que
+# packages/claude-hooks/install.sh (KC_PREFIX/KC_ACCOUNT/ENV_FILE), para leer
+# la clave de owner (internal_api_key) que ya usan los hooks de Claude Code.
+MF_KEYCHAIN_PREFIX="${MEMORYFIRST_KEYCHAIN_PREFIX:-codelabs/memoryfirst}"
+MF_KEYCHAIN_ACCOUNT="${MEMORYFIRST_KEYCHAIN_ACCOUNT:-memoryfirst}"
+MF_HOOKS_ENV_FILE="${MEMORYFIRST_HOOKS_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/memoryfirst/hooks.env}"
+
 build_enroll_payload() {
     cat <<EOF
 {
   "name": "$(json_escape "$MACHINE_NAME")",
-  "person": "$(json_escape "$MACHINE_PERSON")",
-  "pack": "$(json_escape "$PACK_NAME")",
-  "hardware": $(hardware_json),
+  "personId": "$(json_escape "$MACHINE_PERSON")",
+  "tags": ["$(json_escape "pack:${PACK_NAME}")"],
+  "hw": $(hardware_json),
   "capabilities": $(capabilities_json)
 }
 EOF
@@ -46,6 +71,26 @@ save_local_profile() {
     info "Perfil guardado en $MACHINE_PROFILE_FILE"
 }
 
+# resolve_owner_api_key — deja la clave de owner (mf_live_…) en la variable
+# global OWNER_API_KEY, leída del Llavero (macOS) o del fichero de hooks de
+# MemoryFirst (Linux/CI), en ese orden — igual que hacen los hooks de
+# claude-hooks (memoryfirst-session-start.sh y compañía). Nunca la imprime:
+# el fichero de hooks se fuente dentro de un subshell y solo su valor sale
+# por `printf` a la sustitución de comandos que la captura en la variable.
+resolve_owner_api_key() {
+    OWNER_API_KEY=""
+    if has_cmd security; then
+        OWNER_API_KEY="$(security find-generic-password -s "${MF_KEYCHAIN_PREFIX}/internal_api_key" -a "${MF_KEYCHAIN_ACCOUNT}" -w 2>/dev/null || true)"
+    fi
+    if [[ -z "$OWNER_API_KEY" ]]; then
+        OWNER_API_KEY="$(
+            [[ -r "$MF_HOOKS_ENV_FILE" ]] && . "$MF_HOOKS_ENV_FILE"
+            printf '%s' "${MEMORYFIRST_API_KEY:-}"
+        )"
+    fi
+    [[ -z "$OWNER_API_KEY" ]] && OWNER_API_KEY="${MEMORYFIRST_API_KEY:-}"
+}
+
 # store_machine_token <token> — nunca lo imprime, nunca lo pasa por argv.
 store_machine_token() {
     local token="$1"
@@ -58,7 +103,11 @@ store_machine_token() {
         # dobles, escapando \ y " dentro del valor.
         local esc="${token//\\/\\\\}"
         esc="${esc//\"/\\\"}"
-        if security -i <<SEC
+        # Salida silenciada: si `security -i` no entiende la línea la repite
+        # en pantalla, secreto incluido. Solo cuenta el código de salida
+        # (mismo arreglo que memoryfirst/packages/claude-hooks/install.sh,
+        # función keychain_set, commit 2d67eea).
+        if security -i >/dev/null 2>&1 <<SEC
 add-generic-password -U -s "${MACHINE_TOKEN_KC_SERVICE}" -a "${MACHINE_TOKEN_KC_ACCOUNT}" -w "${esc}"
 SEC
         then
@@ -82,14 +131,30 @@ SEC
     fi
 }
 
-# post_enroll <payload> — hace el POST y devuelve por stdout el código HTTP.
-# El cuerpo de la respuesta queda en $RESP_BODY_FILE (global, la limpia el
-# llamador).
+# post_enroll <payload> <api_key> — hace el POST autenticado y devuelve por
+# stdout el código HTTP. El cuerpo de la respuesta queda en $RESP_BODY_FILE
+# (global, la limpia el llamador). La clave viaja a curl en un fichero de
+# cabecera 0600 (-H "@fichero", ver "man curl"), nunca por argv ni por
+# stdin: un fichero temporal por llamada, borrado con un trap de retorno de
+# la función aunque curl falle.
 post_enroll() {
-    local payload="$1"
+    local payload="$1" api_key="${2:-}"
     RESP_BODY_FILE="$(mktemp)"
+    local header_file=""
+    if [[ -n "$api_key" ]]; then
+        header_file="$(mktemp)"
+        chmod 600 "$header_file"
+        printf 'Authorization: Bearer %s\n' "$api_key" > "$header_file"
+    fi
+    # shellcheck disable=SC2064
+    trap "[[ -n '${header_file}' ]] && rm -f '${header_file}'" RETURN
+
+    local -a auth_args=()
+    [[ -n "$header_file" ]] && auth_args=(-H "@${header_file}")
+
     curl -sS -o "$RESP_BODY_FILE" -w '%{http_code}' -X POST \
         -H 'Content-Type: application/json' \
+        "${auth_args[@]}" \
         --max-time 15 \
         -d "$payload" \
         "${FLEET_API_URL}/v1/fleet/machines/enroll" 2>/dev/null || echo "000"
@@ -106,9 +171,10 @@ register_machine() {
 
     if [[ "$DRY_RUN" == true ]]; then
         would "POST ${FLEET_API_URL}/v1/fleet/machines/enroll  (perfil de hardware y capacidades, sin secretos; solo el owner puede llamarla)"
+        would "se autenticaría con Authorization: Bearer <clave de owner>, leída del Llavero ($MF_KEYCHAIN_PREFIX/internal_api_key) o de $MF_HOOKS_ENV_FILE, sin imprimirla; sin esa clave no se llega a llamar a la API"
         would "si 404: guardar el perfil en $MACHINE_PROFILE_FILE y dejar 'codelabs-setup register' para reintentar"
         if [[ "$HW_OS" == macos ]]; then
-            would "si la respuesta trae token: guardarlo en el Llavero ($MACHINE_TOKEN_KC_SERVICE / $MACHINE_TOKEN_KC_ACCOUNT) vía 'security -i' por stdin, nunca por argv ni impreso"
+            would "si la respuesta trae token: guardarlo en el Llavero ($MACHINE_TOKEN_KC_SERVICE / $MACHINE_TOKEN_KC_ACCOUNT) vía 'security -i' por stdin, con su salida silenciada, nunca por argv ni impreso"
         else
             would "si la respuesta trae token: guardarlo 0600 en $MACHINE_TOKEN_ENV_FILE (MEMORYFIRST_MACHINE_TOKEN=…), nunca impreso"
         fi
@@ -124,8 +190,15 @@ register_machine() {
         return
     fi
 
+    resolve_owner_api_key
+    if [[ -z "$OWNER_API_KEY" ]]; then
+        warn "No se encontró la clave de owner de MemoryFirst (Llavero $MF_KEYCHAIN_PREFIX/internal_api_key, o MEMORYFIRST_API_KEY en $MF_HOOKS_ENV_FILE): el alta de flota es solo para el owner y no se puede autenticar. Guardo el perfil para reintentar con 'codelabs-setup register' cuando la clave esté disponible."
+        save_local_profile "$payload"
+        return
+    fi
+
     local http_code
-    http_code="$(post_enroll "$payload")"
+    http_code="$(post_enroll "$payload" "$OWNER_API_KEY")"
 
     case "$http_code" in
         2??)
@@ -144,7 +217,7 @@ register_machine() {
             save_local_profile "$payload"
             ;;
         401|403)
-            warn "La API de flota rechazó el registro (HTTP $http_code): el enroll es solo para el owner. Pide a Jose que lo ejecute o que te dé una vía autorizada."
+            warn "La API de flota rechazó el registro (HTTP $http_code): la clave usada no es de owner, o no es válida. Guardo el perfil para reintentar con 'codelabs-setup register' con una clave de owner correcta."
             save_local_profile "$payload"
             ;;
         *)
@@ -156,12 +229,19 @@ register_machine() {
 }
 
 retry_register() {
-    [[ -f "$MACHINE_PROFILE_FILE" ]] || die "No hay perfil guardado en $MACHINE_PROFILE_FILE. Ejecuta primero 'codelabs-setup enroll'."
+    [[ -f "$MACHINE_PROFILE_FILE" ]] || die "No hay perfil guardado en $MACHINE_PROFILE_FILE. Ejecuta primero 'codelabs-setup enroll' o 'codelabs-setup register --name … --person … --pack …'."
     require_cmd curl "curl no está disponible; no se puede reintentar el registro"
+
+    resolve_owner_api_key
+    if [[ -z "$OWNER_API_KEY" ]]; then
+        warn "No se encontró la clave de owner de MemoryFirst (Llavero $MF_KEYCHAIN_PREFIX/internal_api_key, o MEMORYFIRST_API_KEY en $MF_HOOKS_ENV_FILE): el alta de flota es solo para el owner y no se puede autenticar. Repite cuando la clave esté disponible."
+        return
+    fi
+
     log "Reintentando registro de flota con el perfil guardado ($MACHINE_PROFILE_FILE)"
     local payload; payload="$(cat "$MACHINE_PROFILE_FILE")"
     local http_code
-    http_code="$(post_enroll "$payload")"
+    http_code="$(post_enroll "$payload" "$OWNER_API_KEY")"
     case "$http_code" in
         2??)
             local token; token="$(extract_token "$RESP_BODY_FILE")"
@@ -170,7 +250,7 @@ retry_register() {
             ;;
         404) warn "Sigue en 404: la API de flota no responde en esa ruta todavía." ;;
         000) warn "Sin conectividad con ${FLEET_API_URL}." ;;
-        401|403) warn "La API rechazó el reintento (HTTP $http_code): el enroll es solo para el owner." ;;
+        401|403) warn "La API rechazó el reintento (HTTP $http_code): la clave usada no es de owner, o no es válida." ;;
         *) warn "Sigue fallando (HTTP $http_code)." ;;
     esac
     rm -f "$RESP_BODY_FILE"

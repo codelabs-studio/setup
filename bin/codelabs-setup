@@ -49,7 +49,9 @@ USO
                          --pack <founder|developer|marketer|learner|worker> \
                          [--repos repo-a,repo-b] [--dry-run]
   codelabs-setup doctor
-  codelabs-setup register
+  codelabs-setup register [--name <nombre> --person <id-de-persona> \
+                            --pack <founder|developer|marketer|learner|worker>] \
+                           [--dry-run]
   codelabs-setup --help
 
 enroll
@@ -65,9 +67,21 @@ doctor
   credencial, solo si existe y con qué permisos.
 
 register
-  Reintenta el alta en la flota de MemoryFirst con el perfil ya guardado en
-  ~/.config/codelabs/machine.json (para cuando el primer enroll dio 404
-  porque la API todavía no existía).
+  Da de alta (o reintenta el alta de) esta máquina en la flota de MemoryFirst
+  SIN tocar nada más (no instala, no clona, no toca settings.json): solo mide
+  hardware/capacidades y llama a POST /v1/fleet/machines/enroll.
+  - Sin argumentos: reintenta con el perfil ya guardado en
+    ~/.config/codelabs/machine.json (para cuando un enroll o un register
+    anterior dio 404 o falló la red). Falla si no hay perfil guardado.
+  - Con --name/--person/--pack: construye el perfil desde cero y lo registra
+    (para dar de alta una máquina que no ha pasado por 'enroll', p.ej. porque
+    ya estaba instalada a mano). --person espera el id (uuid) de la persona
+    tal y como lo devuelve GET /v1/admin/persons; un email no lo acepta la
+    API (EnrollSchema.personId es un uuid).
+  La API exige Authorization: Bearer con la clave de OWNER de MemoryFirst
+  (Llavero codelabs/memoryfirst/internal_api_key en macOS, o
+  MEMORYFIRST_API_KEY en ~/.config/memoryfirst/hooks.env); sin ella, avisa y
+  guarda el perfil para reintentar, nunca imprime la clave.
 EOF
 }
 
@@ -178,9 +192,46 @@ cmd_doctor() {
 }
 
 cmd_register() {
+    local name="" person="" pack=""
+    DRY_RUN=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="${2:?falta el valor de --name}"; shift 2 ;;
+            --person) person="${2:?falta el valor de --person}"; shift 2 ;;
+            --pack) pack="${2:?falta el valor de --pack}"; shift 2 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Opción desconocida: $1 (usa --help)" ;;
+        esac
+    done
+
     detect_hardware
     detect_capabilities
-    retry_register
+
+    if [[ -z "$name" && -z "$person" && -z "$pack" ]]; then
+        [[ "$DRY_RUN" == true ]] && info "MODO DRY-RUN: register sin --name/--person/--pack reintenta el perfil guardado; --dry-run no cambia ese reintento."
+        retry_register
+        return
+    fi
+
+    [[ -n "$name" ]] || die "Falta --name"
+    [[ -n "$person" ]] || die "Falta --person"
+    [[ -n "$pack" ]] || die "Falta --pack"
+
+    MACHINE_NAME="$name"
+    MACHINE_PERSON="$person"
+    load_pack "$pack"
+
+    log "codelabs-setup register — alta en la flota sin instalar nada ($PACK_LABEL)"
+    info "Máquina: $MACHINE_NAME · Persona: $MACHINE_PERSON · Pack: $pack"
+    [[ "$DRY_RUN" == true ]] && info "MODO DRY-RUN: no se llama a la API"
+    echo
+    hardware_summary
+    echo
+    capabilities_summary
+    echo
+
+    register_machine
 }
 
 main() {
